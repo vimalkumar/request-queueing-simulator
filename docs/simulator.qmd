@@ -1,0 +1,212 @@
+---
+title: "Simulator Guide"
+subtitle: "How to run, customize, and interpret the simulation"
+---
+
+## Overview
+
+The simulator uses **[Ciw](https://ciw.readthedocs.io/)**, a Python library for discrete event simulation of queuing networks. It models your Kubernetes pods as M/G/c queues and compares performance across different pod sizing configurations.
+
+Two interfaces are provided:
+
+| Tool | Best for | Command |
+|------|----------|---------|
+| `simulator.py` | Batch runs, CI/CD, generating static charts for presentations | `python simulator.py` |
+| `interactive_app.py` | Exploration, parameter tuning, demos | `streamlit run interactive_app.py` |
+
+## Installation
+
+```bash
+# Clone and setup
+cd dsystem-simulator
+uv venv .venv
+source .venv/bin/activate
+
+# Install all dependencies
+uv pip install ciw numpy matplotlib Pillow streamlit plotly pandas
+```
+
+## Running the Batch Simulator
+
+```bash
+python simulator.py
+```
+
+This runs a 300-second simulation with default parameters and generates:
+
+| Output File | Description |
+|------------|-------------|
+| `output/cdf_comparison.png` | Response time CDF for all scenarios |
+| `output/percentile_comparison.png` | P90/P95/P99/P99.9 grouped bar chart |
+| `output/histogram_comparison.png` | Response time distribution histograms |
+| `output/boxplot_comparison.png` | Box plot showing spread and outliers |
+| `output/gantt_chart.png` | Per-core processing timeline |
+| `output/queue_timeseries.png` | Queue depth over time |
+| `output/improvement_summary.png` | % improvement vs single-core baseline |
+| `output/queue_animation.gif` | Animated queue state visualization |
+
+## Running the Interactive Dashboard
+
+```bash
+streamlit run interactive_app.py
+```
+
+Opens at [http://localhost:8501](http://localhost:8501). The dashboard has five tabs:
+
+### Tab: Latency Analysis
+
+Interactive Plotly charts showing CDF, tail zoom, percentile bars, and histograms. **Hover** over any point for exact values. **Zoom** into the tail to compare P99 numbers.
+
+### Tab: Live Pod View
+
+A **time slider** that lets you scrub through the simulation and see what each pod's cores are doing at any instant. Blue = light request, Red = heavy request, Gray = idle. Also includes an animated bar chart with Play/Pause controls.
+
+### Tab: Queue Depth
+
+Time series showing queue buildup at Pod #1 for each scenario. The gap between the colored area (serving) and the gray area (total) is the queue — those are the blocked requests.
+
+### Tab: Gantt Timeline
+
+Select any scenario and see a per-core processing timeline. Hover over blocks to see exact service and wait times. This is the most intuitive view of HOL blocking.
+
+### Tab: Raw Data
+
+Full comparison table, improvement percentages, and a theory-vs-simulation validation check using the Pollaczek-Khinchine formula.
+
+## Customizing Parameters
+
+### In the Interactive Dashboard
+
+Use the **sidebar sliders** to adjust:
+
+| Parameter | Default | What it controls |
+|-----------|---------|-----------------|
+| Total CPU Cores | 24 | Total compute capacity (constant across scenarios) |
+| Light Request CPU | 20ms | Typical request duration |
+| Heavy Request CPU | 500ms | Expensive request duration |
+| Heavy Request % | 5% | Fraction of heavy requests |
+| Target Utilization | 70% | How busy each core is on average |
+| Simulation Duration | 120s | More time = more stable P99.9 |
+
+The simulation re-runs automatically when you change any parameter. Results are cached, so re-visiting the same parameters is instant.
+
+### In the Batch Simulator
+
+Edit the constants at the top of `simulator.py`:
+
+```python
+TOTAL_CORES = 24
+LIGHT_SERVICE_TIME = 0.020        # 20ms
+HEAVY_SERVICE_TIME = 0.500        # 500ms
+HEAVY_REQUEST_PROB = 0.05         # 5%
+TARGET_UTILIZATION = 0.70         # 70%
+SIM_TIME = 300                    # 5 minutes
+```
+
+### Guidelines for Realistic Parameters
+
+**Match your production workload:**
+
+- Check your APM/tracing tool for the P50 and P99 *server processing time* (not including network). Use P50 as `LIGHT_SERVICE_TIME` and P99 as `HEAVY_SERVICE_TIME`.
+- Count the fraction of requests above a threshold (e.g., >200ms) for `HEAVY_REQUEST_PROB`.
+- Check your pod CPU utilization dashboards for `TARGET_UTILIZATION`.
+- `TOTAL_CORES` should match your deployment scale.
+
+**Sensitivity to explore:**
+
+- What happens at 80% utilization vs 60%? (Queuing delays are *non-linear* in ρ)
+- What if heavy requests are 10% instead of 5%? (CV² changes significantly)
+- What if heavy requests are only 200ms instead of 500ms? (CV² drops, less HOL impact)
+
+## How the Simulation Works
+
+### Model Architecture
+
+Each scenario models pods as **independent Ciw nodes**:
+
+```
+Scenario: 6 × 4-core pods
+
+   Poisson(λ/6)    Poisson(λ/6)         Poisson(λ/6)
+       │                │                     │
+       ▼                ▼                     ▼
+  ┌─────────┐     ┌─────────┐          ┌─────────┐
+  │ Node 1  │     │ Node 2  │   ...    │ Node 6  │
+  │ 4 servers│     │ 4 servers│          │ 4 servers│
+  │ (cores) │     │ (cores) │          │ (cores) │
+  └─────────┘     └─────────┘          └─────────┘
+       │                │                     │
+       ▼                ▼                     ▼
+     Exit             Exit                  Exit
+```
+
+- **Arrivals** are Poisson (memoryless) with rate split equally across pods — approximating round-robin routing for stationary analysis.
+- **Service times** follow the bimodal distribution (20ms or 500ms).
+- **No inter-node routing** — after service, requests exit. This models the real system where each request is handled by exactly one pod.
+- **Within each node**, Ciw manages the multi-server queue: shared FIFO queue with c servers pulling from it. This models the Linux scheduler distributing work across cores.
+
+### Warmup Period
+
+The first 10% of simulation time is discarded as warmup. This removes transient effects from the empty system startup.
+
+### Statistical Significance
+
+For P99.9 to be meaningful, you need at least ~10,000 requests (so P99.9 represents ≥10 data points). The default 120s simulation with 24 cores at 70% utilization generates ~40,000 requests — sufficient for robust P99.9 estimates.
+
+For even more confidence, increase `sim_time` to 300s (~100,000 requests).
+
+## Extending the Model
+
+### Adding More Scenarios
+
+Edit the `SCENARIOS` dict in `simulator.py` or the `SCENARIO_CONFIGS` builder in `interactive_app.py` to add custom configurations.
+
+### Different Service Distributions
+
+Replace `BimodalServiceDist` with any `ciw.dists.Distribution` subclass:
+
+```python
+class TrimodalDist(ciw.dists.Distribution):
+    def sample(self, t=None, ind=None):
+        r = random.random()
+        if r < 0.90:
+            return 0.020   # 90% at 20ms
+        elif r < 0.98:
+            return 0.200   # 8% at 200ms
+        else:
+            return 1.000   # 2% at 1000ms
+```
+
+### Modeling Least-Connection Routing
+
+The current model uses equal-probability routing (approximating round-robin). For least-connection, you could implement a custom Ciw routing class that checks node queue depths. However, for stationary analysis, the difference is small — the key insight about multi-core pods holds regardless of routing algorithm.
+
+## Interpreting Results
+
+### What "Good" Looks Like
+
+- **P99 close to the heavy request time** (e.g., ~500ms). This means almost no queueing — the heavy requests dominate P99 by their own service time, not by blocking others.
+- **P90 close to the light request time** (e.g., ~20ms). Most requests complete at their natural speed.
+- **Low standard deviation**. Less variance = more predictable performance.
+
+### Red Flags
+
+- **P99 >> heavy request time**: Requests are queueing behind *multiple* heavy requests. System may be overloaded.
+- **Mean >> median**: The distribution is heavily skewed by HOL blocking.
+- **Theory and simulation disagree by >20%**: Check that utilization is below ~85% and simulation time is sufficient.
+
+## Hosting the Documentation
+
+This Quarto site can be deployed to Netlify:
+
+```bash
+# Build the site
+cd docs
+quarto render
+
+# The _site/ directory contains the static HTML
+# Deploy to Netlify via CLI or Git integration
+```
+
+See the `netlify.toml` in the project root for the deployment configuration.
+

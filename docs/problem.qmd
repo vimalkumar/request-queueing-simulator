@@ -1,0 +1,107 @@
+---
+title: "The Problem: Head-of-Line Blocking"
+subtitle: "Why single-core pods create tail latency spikes"
+---
+
+## What's Actually Happening
+
+Your service handles two types of requests:
+
+| Type | CPU Time | Frequency | Examples |
+|------|----------|-----------|----------|
+| **Light** | ~20ms | 95% of traffic | Simple lookups, cache hits, basic CRUD |
+| **Heavy** | ~500ms | 5% of traffic | Complex aggregations, fan-out queries, ML inference |
+
+The problem isn't the heavy requests themselves — it's what they do to the light requests *behind them* in the queue.
+
+## Head-of-Line Blocking, Visualized
+
+### Single-Core Pod (the problem)
+
+Each pod has one core, one queue. Requests are processed strictly in order:
+
+```
+Time ──────────────────────────────────────────────────────►
+
+Pod A (1 core):
+  ┌──────────────────────────┐┌──┐┌──┐┌──┐┌──┐
+  │    Heavy Request (500ms) ││20││20││20││20│  ← These 4 waited 500ms!
+  └──────────────────────────┘└──┘└──┘└──┘└──┘    Total response: 520ms
+
+Pod B (1 core):
+  ┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐
+  │20││20││20││20││20││20││20││20│  ← Normal processing
+  └──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘    Total response: ~20ms
+
+Pod C (1 core):
+  ┌──┐┌──┐           ┌──┐┌──┐┌──┐
+  │20││20│  (idle)    │20││20││20│  ← This pod was IDLE while
+  └──┘└──┘           └──┘└──┘└──┘    Pod A's queue was growing!
+```
+
+**What went wrong:** The 4 light requests queued behind the heavy request each experienced ~520ms response time instead of ~20ms. That's a **26× latency inflation**. These become your P99 outliers.
+
+Meanwhile, Pod C was sitting idle with nothing to do. The load balancer couldn't predict that Pod A would be blocked.
+
+### Multi-Core Pod (the solution)
+
+A 4-core pod has one queue but four processors pulling from it in parallel:
+
+```
+4-Core Pod:
+  Core 1: ┌──────────────────────────┐  ← Heavy request occupies 1 core
+  Core 2: ┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐    ← Light requests keep flowing!
+  Core 3: ┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐    ← No HOL blocking
+  Core 4: ┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐    ← All cores productive
+```
+
+The heavy request only blocks 1 of 4 cores. The other 3 continue serving light requests immediately. The queue barely builds up.
+
+## Why Load Balancers Can't Fix This
+
+### Round-Robin (Envoy)
+
+Distributes requests sequentially: Pod A, Pod B, Pod C, Pod A, Pod B, Pod C...
+
+**Problem:** Doesn't know Pod A is stuck on a 500ms request. Keeps sending work to it.
+
+### Least-Connection (Istio)
+
+Routes to the pod with the fewest active connections.
+
+**Better, but still limited:** It sees that Pod A has 1 active connection. Pod B might also have 1. It doesn't know that Pod A's 1 connection will take 500ms while Pod B's takes 20ms. They look identical.
+
+### What would actually fix it at the LB level?
+
+You'd need a **request-cost-aware load balancer** — one that knows how long each request will take before routing it. This is what Google's [Prequal system](https://www.usenix.org/system/files/nsdi24-wydrowski.pdf) does, but it requires deep integration. Multi-core pods give you 80% of the benefit with zero load balancer changes.
+
+## The Math Behind the Pain
+
+The severity of HOL blocking depends on how *variable* your request times are. Queuing theory measures this with the **squared coefficient of variation (CV²)**:
+
+$$
+CV^2 = \frac{\text{Var}[S]}{E[S]^2}
+$$
+
+For our bimodal workload:
+
+- **E[S]** = 0.95 × 20 + 0.05 × 500 = **44ms** (average service time)
+- **Var[S]** = 0.95 × 0.05 × (500 − 20)² = **10,944 ms²**
+- **CV²** = 10,944 / 44² = **5.65**
+
+::: {.callout-danger}
+**CV² = 5.65 is extremely high.** For reference, exponential service (which is already quite variable) has CV² = 1. Our workload is 5.65× more variable — and queuing delays scale proportionally with CV².
+:::
+
+The Pollaczek-Khinchine formula tells us the mean waiting time for an M/G/1 queue:
+
+$$
+W_q = \frac{\lambda \cdot E[S^2]}{2(1 - \rho)} = \frac{\rho^2(1 + CV^2)}{2(1-\rho)} \cdot \frac{1}{\lambda}
+$$
+
+At 70% utilization: **W_q = 341ms** average wait. The mean response time is **385ms** — nearly 10× the average service time.
+
+If the workload were deterministic (same mean, CV² = 0), the wait would be only 51ms. **The high variance is costing us 290ms of unnecessary queueing delay on average**, and much more at the tails.
+
+→ *Continue to [Queuing Theory](theory.qmd) for the full mathematical treatment and the M/G/c analysis.*
+

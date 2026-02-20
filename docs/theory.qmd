@@ -1,0 +1,178 @@
+---
+title: "Queuing Theory Deep Dive"
+subtitle: "M/G/1 vs M/G/c — the mathematics of why multi-core pods work"
+---
+
+## Modeling Pods as Queues
+
+Every pod in your Kubernetes cluster is a **queuing system**: requests arrive, wait (if the server is busy), get processed, and leave. The notation **M/G/c** describes the system:
+
+| Letter | Meaning | Our System |
+|--------|---------|------------|
+| **M** | **M**arkovian (Poisson) arrivals | Requests arrive randomly |
+| **G** | **G**eneral service time distribution | Bimodal: 20ms or 500ms |
+| **c** | Number of servers (cores) | 1, 4, 8, or 24 |
+
+| Pod Config | Queue Model | Queues | Servers/Queue | Total |
+|-----------|-------------|--------|--------------|-------|
+| 1-core × 24 | M/G/**1** | 24 | 1 | 24 |
+| 4-core × 6 | M/G/**4** | 6 | 4 | 24 |
+| 8-core × 3 | M/G/**8** | 3 | 8 | 24 |
+| 24-core × 1 | M/G/**24** | 1 | 24 | 24 |
+
+Total capacity stays at 24 cores in every configuration. We're trading **many small queues** for **fewer large queues**.
+
+## Key Parameters
+
+| Symbol | Definition | Value |
+|--------|-----------|-------|
+| λ | Arrival rate per core | 15.91 req/s |
+| E[S] | Mean service time | 44ms |
+| E[S²] | Second moment of service | 0.01288 s² |
+| ρ = λ·E[S] | Utilization per core | 0.70 (70%) |
+| CV² | Squared coefficient of variation | 5.65 |
+
+The **CV²** is the single most important number. It captures how "spiky" the workload is. At CV² = 5.65, the variance penalty is severe.
+
+## M/G/1 Analysis (Single-Core Pods)
+
+### The Pollaczek-Khinchine Formula
+
+For an M/G/1 queue, the mean waiting time in queue is:
+
+$$
+W_q = \frac{\lambda \cdot E[S^2]}{2(1 - \rho)}
+$$
+
+Plugging in our values:
+
+$$
+W_q = \frac{15.91 \times 0.01288}{2 \times 0.30} = \frac{0.2049}{0.60} = 341.5 \text{ms}
+$$
+
+**Mean response time:**
+
+$$
+W = W_q + E[S] = 341.5 + 44.0 = 385.5 \text{ms}
+$$
+
+::: {.callout-danger}
+**A request that takes 44ms to process has a 385ms response time.** The extra 341ms is pure queueing — waiting behind other requests. At the tails (P99, P99.9), this is much worse.
+:::
+
+### The Variance Penalty
+
+An equivalent form of the P-K formula reveals the role of CV²:
+
+$$
+W_q = \frac{\rho}{1 - \rho} \cdot \frac{1 + CV^2}{2} \cdot E[S]
+$$
+
+The factor $\frac{1 + CV^2}{2}$ is the **variance penalty multiplier**:
+
+| CV² | Multiplier | Interpretation |
+|-----|-----------|----------------|
+| 0 (deterministic) | 0.5 | Best case — no variance |
+| 1 (exponential) | 1.0 | Moderate variance |
+| **5.65 (our workload)** | **3.33** | **Severe — 3.3× worse than exponential** |
+
+If our service were deterministic (same 44ms for every request), the wait would be only 51ms instead of 341ms. The bimodal distribution creates **6.7× more queueing delay**.
+
+### Mean Number in System (Little's Law)
+
+$$
+L = \lambda \cdot W = 15.91 \times 0.3855 = 6.13 \text{ requests}
+$$
+
+On average, 6.13 requests are in the system — but the pod can only serve 1 at a time. The other 5+ are waiting.
+
+## M/G/c Analysis (Multi-Core Pods)
+
+### Why Multi-Server Queues Are Better
+
+There's no simple closed-form for M/G/c, but the key insight is the **pooling effect**:
+
+::: {.callout-insight}
+**A single M/G/c queue always outperforms c independent M/G/1 queues** at the same total utilization. This is a fundamental result in queuing theory known as the *economies of scale* or *pooling effect*.
+:::
+
+Why? In M/G/c:
+
+1. **A request only waits if ALL c servers are busy.** In c separate M/G/1 queues, a request waits if *its assigned server* is busy — even if other servers are free.
+
+2. **The probability that all servers are busy decreases exponentially with c.** Roughly: P(all busy) ∝ ρ^c. For ρ=0.7: one server busy = 70%, all 4 busy ≈ 24%, all 8 busy ≈ 6%.
+
+3. **Multiple servers drain the queue faster.** When the queue builds up (e.g., after a heavy request), c servers pull from it simultaneously.
+
+### Intuitive Comparison
+
+**24 × M/G/1 (single-core):** Each pod has its own private queue. If a pod gets a heavy request, its queue grows. Other pods with empty queues can't help — the work is "locked" to the wrong pod.
+
+**6 × M/G/4 (four-core):** Each pod has a shared queue with 4 servers. A heavy request occupies 1 server. The other 3 immediately serve the next requests in queue. Queue rarely builds up.
+
+**1 × M/G/24 (shared queue):** All 24 cores share one queue. This is the theoretical optimum — any idle core serves the next request. Zero wasted capacity.
+
+### The Approximation for M/G/c Wait
+
+A useful approximation (Kingman/Allen-Cunneen):
+
+$$
+W_q^{(c)} \approx W_q^{(M/M/c)} \cdot \frac{1 + CV^2}{2}
+$$
+
+Where $W_q^{(M/M/c)}$ is the well-known Erlang-C wait time. The key point: while CV² still matters, the M/M/c base wait time drops dramatically with c, because the Erlang-C probability of waiting (P(all c servers busy)) shrinks exponentially.
+
+## Why This Matters for Tail Latency
+
+The **mean** response time only tells part of the story. For SLA compliance, we care about **P99** and **P99.9** — the worst-case experience.
+
+In an M/G/1 queue with bimodal service:
+
+- **P50** is driven by typical requests (close to 20ms for light requests)
+- **P99** is driven by requests that arrive *just after* a heavy request — they wait up to 500ms
+- **P99.9** is driven by requests that arrive after *multiple consecutive* heavy requests
+
+The variance in service time directly amplifies tail latency. Multi-core pods reduce this by ensuring that heavy requests can't monopolize all capacity.
+
+### Simulated Results (from our Ciw simulation)
+
+| Percentile | 1-core (M/G/1) | 4-core (M/G/4) | 8-core (M/G/8) | Improvement |
+|-----------|----------------|-----------------|-----------------|-------------|
+| P50 | 199ms | 20ms | 20ms | −90% |
+| P90 | 975ms | 281ms | 110ms | −89% |
+| P99 | 1,889ms | 627ms | 511ms | −73% |
+| P99.9 | 2,681ms | 896ms | 660ms | −75% |
+
+::: {.callout-success}
+**Moving from 1-core to 4-core pods reduces P99 by 67% and P99.9 by 67%.** Going to 8-core provides further improvement. The diminishing returns suggest 4-core or 8-core is the sweet spot for this workload.
+:::
+
+## The Linux Scheduler Advantage
+
+Within a multi-core pod, the **Linux CFS (Completely Fair Scheduler)** acts as the inner load balancer:
+
+- **Work-stealing:** Idle cores pull tasks from busy cores' run queues
+- **Microsecond response:** Scheduling decisions happen in ~μs, not ms
+- **CPU-aware:** It sees actual CPU utilization, not just connection count
+- **Free:** No infrastructure changes, no config, no overhead
+
+This is fundamentally different from network-level load balancing:
+
+| Property | Envoy/Istio | Linux Scheduler |
+|----------|-------------|-----------------|
+| Routing signal | Connection count | CPU run queue depth |
+| Knows request cost? | No | Yes (after ~1 time slice) |
+| Response time | ~ms | ~μs |
+| Can redistribute mid-request? | No | Yes (preemptive) |
+
+## Summary
+
+The mathematical story is clear:
+
+1. **Bimodal service → high CV² → severe M/G/1 queueing**
+2. **M/G/c (multi-core) pools variance across servers**, reducing wait times exponentially with c
+3. **The Linux scheduler provides the intelligent, CPU-aware load balancing** that network-level balancers can't
+4. **4-core pods capture most of the benefit** — the move from 1→4 cores is transformative; 4→8 is incremental
+
+→ *See [Simulator Guide](simulator.qmd) to run the simulation yourself and validate these results with your own parameters.*
+

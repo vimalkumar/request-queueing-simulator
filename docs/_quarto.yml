@@ -1,0 +1,20 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "K8s Pod Sizing — Queuing Theory & Simulation"
+  navbar: false
+  sidebar: false
+  page-footer: ""
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    self-contained: true
+    minimal: true
+    code-fold: true
+    smooth-scroll: true
