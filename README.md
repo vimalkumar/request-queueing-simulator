@@ -1,5 +1,7 @@
 # ⚡ K8s Pod Sizing Simulator
 
+> **[▶ Live Demo — request-queueing-simulator.streamlit.app](https://request-queueing-simulator.streamlit.app/)**
+
 Should you run 24 single-core pods or 6 four-core pods? This simulator answers that question using **queuing theory** and **discrete event simulation**, showing exactly how multi-core pods fix tail latency caused by head-of-line blocking.
 
 ## The Queuing Theory Problem
